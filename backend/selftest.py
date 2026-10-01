@@ -50,6 +50,7 @@ def run_all():
     _test_control_flow()
     _test_lists()
     _test_runtime_errors()
+    _test_runtime_invalid_args()
     _test_debugger()
     _test_profiler()
     _test_memory_model()
@@ -150,6 +151,76 @@ def _test_runtime_errors():
     ok3 = any("radus" in e.message and e.fix for e in errs3)
     _check("错误诊断：未定义变量带 did-you-mean 修复建议", ok3,
            str([(e.message, e.fix) for e in errs3]) if not ok3 else "")
+
+
+def _test_runtime_invalid_args():
+    """所有"参数越界 / 非法参数"都必须产出结构化诊断，且不冒泡成 500（无未捕获异常）。"""
+
+    def expect_diag(source, keywords=()):
+        out = _run(source)
+        err = out.get("error")
+        # service.run 正常返回（HTTP 层即 200），且携带统一结构的运行期诊断
+        if not isinstance(out, dict) or err is None:
+            return False, f"缺少诊断: {out.get('error') if isinstance(out, dict) else out}"
+        if err.get("phase") != "runtime" or not err.get("message") or not err.get("fix"):
+            return False, f"诊断结构不完整: {err}"
+        for kw in keywords:
+            if kw not in err["message"] and kw not in err.get("fix", ""):
+                return False, f"诊断未覆盖关键词 {kw!r}: {err['message']}"
+        return True, err["message"]
+
+    # 1) 取值越界（domain error）—— 本缺陷的核心：sqrt(-1) 曾经直接 500
+    cases = [
+        ("print(sqrt(-1));", ("sqrt", "负数")),
+        ("print(sqrt(-4));", ("sqrt",)),
+        ("print(min(1, \"x\"));", ("min",)),
+        ("print(max(\"a\", 2));", ("max",)),
+        ("print(range(5, 1, 0));", ("range", "步长")),
+        ("print(range(1, 5, \"x\"));", ("range",)),
+        ("print(round(3.14, \"y\"));", ("round", "整数")),
+        ("print(round());", ("round",)),
+        ("print(range());", ("range",)),
+    ]
+    all_ok = True
+    details = []
+    for src, kws in cases:
+        ok, detail = expect_diag(src, kws)
+        all_ok = all_ok and ok
+        if not ok:
+            details.append(f"{src} -> {detail}")
+    _check("运行时错误：参数越界（如 sqrt(-1)）产出结构化诊断而非 500",
+           all_ok, "; ".join(details))
+
+    # 2) 类型非法 —— 与"字符串做算术"保持同样的结构化风格
+    type_cases = [
+        ("print(sqrt(\"x\"));", "type"),
+        ("print(floor(\"x\"));", "type"),
+        ("print(abs(\"x\"));", "type"),
+        ("print(len(1));", "type"),
+        ("print(1 - \"x\");", "type"),
+        ("print(pop(\"x\"));", "type"),
+    ]
+    type_ok = True
+    type_details = []
+    for src, want_kind in type_cases:
+        out = _run(src)
+        err = out.get("error") if isinstance(out, dict) else None
+        if err is None or err.get("kind") != want_kind or not err.get("fix"):
+            type_ok = False
+            type_details.append(f"{src} -> {err}")
+    _check("运行时错误：非法类型参数产出类型诊断（与算术类型错误一致）",
+           type_ok, "; ".join(type_details))
+
+    # 3) 既有诊断仍然有效（除以零、下标越界），保证"彼此一致"
+    dz, _ = expect_diag("print(1 / 0);", ("零",))
+    ior, _ = expect_diag("var a = [1]; print(a[9]);", ("越界",))
+    _check("运行时错误：除以零 / 下标越界诊断保持稳定", dz and ior)
+
+    # 4) 合法调用与字符串拼接等正常路径不受影响
+    ok_out = _run("print(sqrt(9));\nprint(abs(-5));\nprint(1 + \"x\");")
+    _check("运行时错误：合法程序正常运行不误报",
+           ok_out.get("error") is None and ok_out.get("output") == ["3.0", "5", "1x"],
+           str(ok_out.get("output")) + str(ok_out.get("error")))
 
 
 def _test_debugger():

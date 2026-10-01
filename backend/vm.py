@@ -190,6 +190,12 @@ class VM:
             self.finished = True
         except VMRuntimeError as e:
             self._handle_runtime_error(e)
+        except Exception as e:
+            # 兜底：任何未被显式转成诊断的 Python 异常（内置函数域错误、
+            # 类型错误等）都在此统一包装成结构化运行期诊断，绝不冒泡成 HTTP 500。
+            line = getattr(ins, "line", self._cur_line) or self._cur_line or 1
+            self._handle_runtime_error(VMRuntimeError(diag.runtime_internal_error(
+                f"{type(e).__name__}: {e}", line, 1, self._line(line))))
 
     def run(self, pause_fn=None, on_pause=None, max_steps=None):
         """持续执行直到 pause_fn 返回 True、程序结束、出错、或步数耗尽。"""
@@ -326,7 +332,7 @@ class VM:
                 elif isinstance(left, rt.RuntimeList) and isinstance(right, rt.RuntimeList):
                     s.append(self.heap.allocate_list(left.items + right.items))
                 else:
-                    self._type_error(ins, "数字或字符串", f"{rt.type_name(left)} 与 {rt.type_name(right)}")
+                    self._binary_type_error("+", left, right, ins)
             elif op == "-":
                 self._check_numeric(left, right, ins); s.append(left - right)
             elif op == "*":
@@ -335,7 +341,7 @@ class VM:
                 elif isinstance(left, str) and isinstance(right, int):
                     s.append(left * right)
                 else:
-                    self._type_error(ins, "数字", f"{rt.type_name(left)} 与 {rt.type_name(right)}")
+                    self._binary_type_error("*", left, right, ins)
             elif op == "/":
                 self._check_numeric(left, right, ins)
                 if right == 0:
@@ -367,9 +373,10 @@ class VM:
                     "", None, self._line(ins.line)))
         except VMRuntimeError:
             raise
-        except Exception as e:
-            self._runtime_error(diag.runtime_wrong_type(
-                rt.type_name(left), rt.type_name(right), ins.line, 1, self._line(ins.line)))
+        except Exception:
+            self._runtime_error(diag.runtime_binary_type_error(
+                op, rt.type_name(left), rt.type_name(right),
+                ins.line, 1, self._line(ins.line)))
 
     def _unary(self, ins, frame):
         s = frame.stack
@@ -422,12 +429,17 @@ class VM:
         args.reverse()
         callee = frame.stack.pop()
         if isinstance(callee, rt.BuiltinFunction):
+            self._check_builtin_arity(callee, argc, ins)
             if self.profiler:
                 self.profiler.function_enter("builtin:" + callee.name)
             try:
                 result = callee.fn(args)
             except VMRuntimeError:
                 raise
+            except (TypeError, ValueError, OverflowError, ArithmeticError) as e:
+                # 内置函数底层（math/round/min/max 等）抛出的 Python 异常，
+                # 统一转成结构化的"非法参数"诊断，避免冒泡成服务器 500。
+                self._builtin_invalid_arg(callee.name, args, e, ins)
             finally:
                 if self.profiler:
                     self.profiler.function_exit()
@@ -438,9 +450,77 @@ class VM:
             return
         self._type_error(ins, "函数", rt.type_name(callee))
 
+    def _check_builtin_arity(self, callee, argc, ins):
+        """运行期参数个数校验（间接调用无法在语义阶段拦截，这里兜底）。"""
+        if callee.arity is not None and argc != callee.arity:
+            self._runtime_error(diag.runtime_wrong_arity(
+                callee.name, callee.arity, argc, ins.line, 1, self._line(ins.line)))
+        if callee.min_arity is not None and argc < callee.min_arity:
+            self._runtime_error(diag.runtime_wrong_arity(
+                callee.name, None, argc, ins.line, 1, self._line(ins.line),
+                accepted=f"至少 {callee.min_arity} "))
+
+    def _builtin_invalid_arg(self, name, args, exc, ins):
+        """把内置函数收到的非法实参映射为统一风格的运行期诊断。"""
+        line = ins.line
+        src = self._line(line)
+        # 优先按"取值越界"（domain）与"类型不对"（type）给出针对性文案
+        detail = self._builtin_arg_detail(name, args, exc)
+        if detail is not None:
+            message, fix = detail
+            self._runtime_error(diag.runtime_builtin_domain_error(
+                name, message, fix, line, 1, src))
+        expected = self._builtin_expected_types(name, args)
+        actual = "、".join(rt.type_name(a) for a in args) if args else "（无参数）"
+        self._runtime_error(diag.runtime_wrong_type(
+            expected, actual, line, 1, src, op=f"函数 {name}()"))
+
+    def _builtin_expected_types(self, name, args):
+        """兜底类型诊断时，给出该内置函数期望的参数类型描述。"""
+        numeric_fns = ("sqrt", "floor", "ceil", "abs")
+        if name in numeric_fns:
+            return "数值（int 或 float）"
+        if name == "round":
+            return "数值（可选第二个整数位数参数）"
+        if name in ("min", "max"):
+            return "类型一致、可相互比较的值"
+        if name == "range":
+            return "整数（起点、终点、步长）"
+        return "类型与函数签名匹配的值"
+
+    def _builtin_arg_detail(self, name, args, exc):
+        """为可判定的越界 / 非法取值场景返回 (message, fix)，否则返回 None。"""
+        x = args[0] if args else None
+        numeric = isinstance(x, (int, float)) and not isinstance(x, bool)
+        if name == "sqrt" and numeric:
+            return ("平方根的被开方数不能是负数",
+                   "sqrt() 只接受非负数（x >= 0）；若需要处理负数，请先取绝对值 abs(x)。")
+        if name in ("floor", "ceil") and numeric:
+            return ("参数数值超出可表示范围",
+                    "检查传入的数值是否过大，先把它限制在合理范围内。")
+        if name == "round" and numeric:
+            if len(args) == 2 and not isinstance(args[1], int):
+                return ("round() 的第二个参数（保留位数）必须是整数",
+                        "把保留位数改成整数字面量，例如 round(x, 2)。")
+            return ("参数数值超出可表示范围",
+                    "检查传入的数值是否过大或不是有限数。")
+        if name in ("min", "max"):
+            return (f"{name}() 只能在相互可比较的值之间取{'最小' if name == 'min' else '最大'}值",
+                    "确保传入的值类型一致（全是数字或全是字符串），不要混用数字与字符串。")
+        if name == "range":
+            return ("range() 的起点、终点、步长都必须是整数，且步长不能为 0",
+                    "把实参改为整数；若用了变量，先用 int() 转换，并确保步长不为 0。")
+        if name == "abs" and numeric:
+            return ("参数数值超出可表示范围",
+                    "检查传入的数值是否过大。")
+        if isinstance(exc, (ValueError, OverflowError)) and numeric:
+            return ("参数取值超出该函数允许的范围",
+                    "检查参数的取值范围，先用条件判断保护，再调用该函数。")
+        return None
+
     def _call_user(self, ins, frame, func, args):
         if len(args) != func.arity:
-            self._runtime_error(diag.semantic_wrong_arity(
+            self._runtime_error(diag.runtime_wrong_arity(
                 func.name, func.arity, len(args), ins.line, 1, self._line(ins.line)))
         if len(self.frames) >= self.max_call_depth:
             self._runtime_error(diag.runtime_stack_overflow(
@@ -483,16 +563,21 @@ class VM:
         self._runtime_error(diag.runtime_wrong_type(
             expected, actual, ins.line, 1, self._line(ins.line)))
 
+    def _binary_type_error(self, op, left, right, ins):
+        self._runtime_error(diag.runtime_binary_type_error(
+            op, rt.type_name(left), rt.type_name(right),
+            ins.line, 1, self._line(ins.line)))
+
     def _check_numeric(self, a, b, ins):
         if not (isinstance(a, (int, float)) and not isinstance(a, bool)
                 and isinstance(b, (int, float)) and not isinstance(b, bool)):
-            self._type_error(ins, "数字", f"{rt.type_name(a)} 与 {rt.type_name(b)}")
+            self._binary_type_error(ins.operand, a, b, ins)
 
     def _check_comparable(self, a, b, ins):
         if not ((isinstance(a, (int, float, str, rt.RuntimeString)) and
                  isinstance(b, (int, float, str, rt.RuntimeString))) or
                 (isinstance(a, (int, float)) and isinstance(b, (int, float)))):
-            self._type_error(ins, "可比较的类型", f"{rt.type_name(a)} 与 {rt.type_name(b)}")
+            self._binary_type_error(ins.operand, a, b, ins)
 
     def _check_indexable(self, target, ins):
         if not isinstance(target, (rt.RuntimeList, str, rt.RuntimeString)):
@@ -538,12 +623,12 @@ class VM:
             return len(v.items)
         if isinstance(v, (str, rt.RuntimeString)):
             return len(_to_py_str(v))
-        self._builtin_type_error("列表或字符串", rt.type_name(v))
+        self._builtin_type_error("列表或字符串", rt.type_name(v), op="len()")
 
     def _bi_push(self, args):
         lst, val = args
         if not isinstance(lst, rt.RuntimeList):
-            self._builtin_type_error("列表", rt.type_name(lst))
+            self._builtin_type_error("列表", rt.type_name(lst), op="push() 的第一个参数")
         lst.items.append(val)
         lst.size = len(lst.items)
         return lst
@@ -551,7 +636,7 @@ class VM:
     def _bi_pop(self, args):
         lst = args[0]
         if not isinstance(lst, rt.RuntimeList):
-            self._builtin_type_error("列表", rt.type_name(lst))
+            self._builtin_type_error("列表", rt.type_name(lst), op="pop()")
         if not lst.items:
             return None
         return lst.items.pop()
@@ -597,7 +682,9 @@ class VM:
         elif len(args) == 3:
             start, stop, step = args
         else:
-            self._builtin_type_error("1~3 个参数", str(len(args)))
+            self._runtime_error(diag.runtime_wrong_arity(
+                "range", None, len(args), self._cur_line or 1, 1,
+                self._line(self._cur_line or 1), accepted="1~3 "))
         return self.heap.allocate_list(list(range(start, stop + 1, step)))
 
     def _bi_abs(self, args):
@@ -619,6 +706,10 @@ class VM:
         return int(math.ceil(args[0]))
 
     def _bi_round(self, args):
+        if not args:
+            self._runtime_error(diag.runtime_wrong_arity(
+                "round", 1, 0, self._cur_line or 1, 1,
+                self._line(self._cur_line or 1)))
         if len(args) == 2:
             return round(args[0], args[1])
         return round(args[0], 1)
@@ -639,10 +730,10 @@ class VM:
         self.return_value = code
         raise SystemExitSignal()
 
-    def _builtin_type_error(self, expected, actual):
+    def _builtin_type_error(self, expected, actual, op=None):
         line = self._cur_line or 1
         self._runtime_error(diag.runtime_wrong_type(
-            expected, actual, line, 1, self._line(line)))
+            expected, actual, line, 1, self._line(line), op=op or "该函数"))
 
 
 # ---------------------------------------------------------------------------

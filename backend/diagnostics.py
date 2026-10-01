@@ -220,7 +220,7 @@ def semantic_redeclared(name, prev_line, line, col, source_line):
 def semantic_wrong_arity(name, expected, got, line, col, source_line):
     return Diagnostic(
         SEVERITY_ERROR, PHASE_SEMANTIC, KIND_ARITY,
-        f"函数 {name!r} 需要 {got} 个参数，但传入了 {expected} 个",
+        f"函数 {name!r} 需要 {expected} 个参数，但传入了 {got} 个",
         line, col, 1, line, col + 1,
         f"调整调用处的实参个数为 {expected} 个，或修改函数定义。",
         None, source_line)
@@ -260,12 +260,61 @@ def runtime_index_out_of_range(idx, length, line, col, source_line):
         None, source_line)
 
 
-def runtime_wrong_type(expected, actual, line, col, source_line):
+def runtime_wrong_type(expected, actual, line, col, source_line, op="该操作"):
     return Diagnostic(
         SEVERITY_ERROR, PHASE_RUNTIME, KIND_TYPE,
-        f"类型错误：期望 {expected}，实际是 {actual}",
+        f"类型错误：{op}要求 {expected} 类型的值，但实际是 {actual}",
         line, col, 1, line, col + 1,
-        f"先做类型检查或转换，再执行该操作。",
+        "先用 type() 确认值的类型，或用 int()/float()/str() 转换后再执行该操作。",
+        None, source_line)
+
+
+def runtime_binary_type_error(op, left_type, right_type, line, col, source_line):
+    """二元运算符两侧操作数类型不兼容（如 1 + \"x\"）。"""
+    return Diagnostic(
+        SEVERITY_ERROR, PHASE_RUNTIME, KIND_TYPE,
+        f"类型错误：运算符 {op!r} 不能作用于 {left_type} 与 {right_type} 类型",
+        line, col, 1, line, col + 1,
+        "确保运算符两侧的类型兼容（数字配数字、字符串配字符串），"
+        "或先用 int()/float()/str() 做类型转换。",
+        None, source_line)
+
+
+def runtime_builtin_domain_error(name, detail, fix, line, col, source_line):
+    """内置函数收到了类型正确但取值越界 / 不合法的参数（如 sqrt(-1)）。"""
+    return Diagnostic(
+        SEVERITY_ERROR, PHASE_RUNTIME, KIND_RUNTIME,
+        f"函数 {name}() 的参数不合法：{detail}",
+        line, col, 1, line, col + 1,
+        fix, None, source_line)
+
+
+def runtime_wrong_arity(name, expected, got, line, col, source_line, accepted=None):
+    """运行期参数个数错误（如间接调用绕过了静态检查、内置函数参数个数不符）。
+
+    expected 为整数时给出精确个数；为 None 时用 accepted（如 "1~3"）描述可接受范围。
+    """
+    if expected is None:
+        scope = f"{accepted}个" if accepted else "合法个数的"
+        message = f"函数 {name!r} 被传入了 {got} 个参数，但它接受 {scope}参数"
+        fix = f"调整调用处的实参个数为 {scope}，或修改函数定义。" if accepted \
+            else "检查该函数允许的参数个数，并调整调用处的实参。"
+    else:
+        message = f"函数 {name!r} 需要 {expected} 个参数，但传入了 {got} 个"
+        fix = f"调整调用处的实参个数为 {expected} 个，或修改函数定义。"
+    return Diagnostic(
+        SEVERITY_ERROR, PHASE_RUNTIME, KIND_ARITY,
+        message, line, col, 1, line, col + 1,
+        fix, None, source_line)
+
+
+def runtime_internal_error(detail, line, col, source_line):
+    """兜底：解释器内部异常绝不应以 500 冒泡，统一包装成可读的运行期诊断。"""
+    return Diagnostic(
+        SEVERITY_ERROR, PHASE_RUNTIME, KIND_RUNTIME,
+        f"执行时遇到未预期的内部错误：{detail}",
+        line, col, 1, line, col + 1,
+        "请检查该行涉及的操作数类型与取值；若问题持续出现，请把源码与该诊断反馈给开发者。",
         None, source_line)
 
 
