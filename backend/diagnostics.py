@@ -220,7 +220,7 @@ def semantic_redeclared(name, prev_line, line, col, source_line):
 def semantic_wrong_arity(name, expected, got, line, col, source_line):
     return Diagnostic(
         SEVERITY_ERROR, PHASE_SEMANTIC, KIND_ARITY,
-        f"函数 {name!r} 需要 {got} 个参数，但传入了 {expected} 个",
+        f"函数 {name!r} 需要 {expected} 个参数，但传入了 {got} 个",
         line, col, 1, line, col + 1,
         f"调整调用处的实参个数为 {expected} 个，或修改函数定义。",
         None, source_line)
@@ -299,6 +299,49 @@ def runtime_name_error(name, candidates, line, col, source_line):
         SEVERITY_ERROR, PHASE_RUNTIME, KIND_NAME,
         f"运行时错误：未定义的变量 {name!r}", line, col, len(name), line, col + len(name),
         fix, None, source_line, related=related)
+
+
+def runtime_wrong_arity(name, need_desc, got, line, col, source_line):
+    """运行期调用参数个数错误（如 min() 未传参、round() 传了 3 个参数）。"""
+    return Diagnostic(
+        SEVERITY_ERROR, PHASE_RUNTIME, KIND_ARITY,
+        f"函数 {name!r} {need_desc}，但传入了 {got} 个参数",
+        line, col, 1, line, col + 1,
+        f"按 {need_desc} 调整调用处的实参个数。",
+        None, source_line)
+
+
+def runtime_builtin_type_error(name, expected, actual, line, col, source_line):
+    """内置函数实参类型错误（如 sqrt("x")、len(123)）。"""
+    return Diagnostic(
+        SEVERITY_ERROR, PHASE_RUNTIME, KIND_TYPE,
+        f"函数 {name!r} 的参数类型错误：期望 {expected}，实际是 {actual}",
+        line, col, 1, line, col + 1,
+        f"先确认传给 {name!r} 的值是 {expected} 类型，必要时用 int()/float()/str() 转换。",
+        None, source_line)
+
+
+def runtime_invalid_argument(name, reason, fix, line, col, source_line):
+    """内置函数实参取值非法（如 sqrt(-1)、range(1, 5, 0)）。"""
+    return Diagnostic(
+        SEVERITY_ERROR, PHASE_RUNTIME, KIND_RUNTIME,
+        f"函数 {name!r} 的参数非法：{reason}",
+        line, col, 1, line, col + 1,
+        fix, None, source_line)
+
+
+def runtime_internal_error(detail, line, col, source_line):
+    """兜底诊断：解释器自身遇到未预料的异常时使用，绝不让 500 冒泡给学习者。"""
+    related = []
+    if detail:
+        related = [{"internal": detail}]
+    return Diagnostic(
+        SEVERITY_ERROR, PHASE_RUNTIME, KIND_RUNTIME,
+        f"运行时遇到未处理的内部错误：{detail}" if detail else "运行时遇到未处理的内部错误",
+        line, col, 1, line, col + 1,
+        "这通常不是程序本身的问题，请把出错源码反馈给平台维护者；"
+        "在此之前可尝试简化或改写触发错误的表达式。",
+        None, source_line, related=related)
 
 
 def warning_unused(name, line, col, source_line):

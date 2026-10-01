@@ -67,13 +67,19 @@ class RuntimeFunction(RuntimeObject):
 
 
 class BuiltinFunction:
-    """内置函数对象。arity 为 None 表示变长参数。"""
+    """内置函数对象。
 
-    def __init__(self, name: str, fn: Callable, arity=None, min_arity=None):
+    arity     —— 固定参数个数（None 表示变长）；
+    min_arity —— 最少参数个数；
+    max_arity —— 最多参数个数（None 表示不限）。
+    """
+
+    def __init__(self, name: str, fn: Callable, arity=None, min_arity=None, max_arity=None):
         self.name = name
         self.fn = fn
         self.arity = arity
         self.min_arity = min_arity if min_arity is not None else arity
+        self.max_arity = max_arity
 
     def __repr__(self):
         return f"<builtin {self.name}>"

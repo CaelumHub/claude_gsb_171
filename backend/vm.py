@@ -106,18 +106,18 @@ class VM:
         b["str"] = rt.BuiltinFunction("str", self._bi_str, 1)
         b["int"] = rt.BuiltinFunction("int", self._bi_int, 1)
         b["float"] = rt.BuiltinFunction("float", self._bi_float, 1)
-        b["range"] = rt.BuiltinFunction("range", self._bi_range, None)
+        b["range"] = rt.BuiltinFunction("range", self._bi_range, None, min_arity=1, max_arity=3)
         b["abs"] = rt.BuiltinFunction("abs", self._bi_abs, 1)
         b["min"] = rt.BuiltinFunction("min", self._bi_min, None, min_arity=1)
         b["max"] = rt.BuiltinFunction("max", self._bi_max, None, min_arity=1)
         b["sqrt"] = rt.BuiltinFunction("sqrt", self._bi_sqrt, 1)
         b["floor"] = rt.BuiltinFunction("floor", self._bi_floor, 1)
         b["ceil"] = rt.BuiltinFunction("ceil", self._bi_ceil, 1)
-        b["round"] = rt.BuiltinFunction("round", self._bi_round, None, min_arity=1)
+        b["round"] = rt.BuiltinFunction("round", self._bi_round, None, min_arity=1, max_arity=2)
         b["input"] = rt.BuiltinFunction("input", self._bi_input, 0)
         b["time"] = rt.BuiltinFunction("time", self._bi_time, 0)
         b["random"] = rt.BuiltinFunction("random", self._bi_random, 0)
-        b["exit"] = rt.BuiltinFunction("exit", self._bi_exit, None, min_arity=0)
+        b["exit"] = rt.BuiltinFunction("exit", self._bi_exit, None, min_arity=0, max_arity=1)
         self.builtins = b
 
     # ------------------------------------------------------------------
@@ -180,16 +180,20 @@ class VM:
         self.instruction_count += 1
         if self.profiler:
             self.profiler.record_instruction(frame.func_name, ins.line)
-        if self.instruction_count > self.instruction_limit:
-            self._runtime_error(diag.runtime_instruction_limit(
-                self.instruction_limit, ins.line, 1, self._line(ins.line)))
-            return
         try:
+            if self.instruction_count > self.instruction_limit:
+                self._runtime_error(diag.runtime_instruction_limit(
+                    self.instruction_limit, ins.line, 1, self._line(ins.line)))
             self._dispatch(ins, frame)
         except SystemExitSignal:
             self.finished = True
         except VMRuntimeError as e:
             self._handle_runtime_error(e)
+        except Exception as e:
+            # 兜底：任何从执行路径里漏网的 Python 异常都转成结构化诊断，
+            # 绝不让用户程序触发后端 500（正常情况下这里的分支不应被命中）。
+            self._handle_runtime_error(VMRuntimeError(diag.runtime_internal_error(
+                f"{type(e).__name__}: {e}", ins.line, 1, self._line(ins.line))))
 
     def run(self, pause_fn=None, on_pause=None, max_steps=None):
         """持续执行直到 pause_fn 返回 True、程序结束、出错、或步数耗尽。"""
@@ -422,12 +426,17 @@ class VM:
         args.reverse()
         callee = frame.stack.pop()
         if isinstance(callee, rt.BuiltinFunction):
+            self._check_builtin_arity(callee, argc, ins)
             if self.profiler:
                 self.profiler.function_enter("builtin:" + callee.name)
             try:
                 result = callee.fn(args)
             except VMRuntimeError:
                 raise
+            except (TypeError, ValueError, OverflowError, ArithmeticError) as e:
+                # 内置函数自身未显式拦截的非法参数 —— 统一映射为结构化诊断，
+                # 例如 min() 比较 int 与 string、round() 收到 string 等。
+                self._invalid_builtin_arg(callee.name, e, ins)
             finally:
                 if self.profiler:
                     self.profiler.function_exit()
@@ -438,10 +447,33 @@ class VM:
             return
         self._type_error(ins, "函数", rt.type_name(callee))
 
+    def _check_builtin_arity(self, callee, argc, ins):
+        """按 BuiltinFunction 的参数个数约束做运行期防御（正常路径已被语义分析拦截）。"""
+        if callee.arity is not None and argc != callee.arity:
+            self._runtime_error(diag.runtime_wrong_arity(
+                callee.name, f"需要 {callee.arity} 个参数", argc,
+                ins.line, 1, self._line(ins.line)))
+        if callee.min_arity is not None and argc < callee.min_arity:
+            self._runtime_error(diag.runtime_wrong_arity(
+                callee.name, f"至少需要 {callee.min_arity} 个参数", argc,
+                ins.line, 1, self._line(ins.line)))
+        if callee.max_arity is not None and argc > callee.max_arity:
+            self._runtime_error(diag.runtime_wrong_arity(
+                callee.name, f"至多接受 {callee.max_arity} 个参数", argc,
+                ins.line, 1, self._line(ins.line)))
+
+    def _invalid_builtin_arg(self, name, exc, ins):
+        detail = str(exc) or type(exc).__name__
+        self._runtime_error(diag.runtime_invalid_argument(
+            name, f"{detail}",
+            f"检查传给 {name}() 的实参类型与取值是否满足要求，必要时先做类型转换或分支保护。",
+            ins.line, 1, self._line(ins.line)))
+
     def _call_user(self, ins, frame, func, args):
         if len(args) != func.arity:
-            self._runtime_error(diag.semantic_wrong_arity(
-                func.name, func.arity, len(args), ins.line, 1, self._line(ins.line)))
+            self._runtime_error(diag.runtime_wrong_arity(
+                func.name, f"需要 {func.arity} 个参数", len(args),
+                ins.line, 1, self._line(ins.line)))
         if len(self.frames) >= self.max_call_depth:
             self._runtime_error(diag.runtime_stack_overflow(
                 self.max_call_depth, ins.line, 1, self._line(ins.line)))
@@ -538,12 +570,12 @@ class VM:
             return len(v.items)
         if isinstance(v, (str, rt.RuntimeString)):
             return len(_to_py_str(v))
-        self._builtin_type_error("列表或字符串", rt.type_name(v))
+        self._builtin_type_error("len", "列表或字符串", rt.type_name(v))
 
     def _bi_push(self, args):
         lst, val = args
         if not isinstance(lst, rt.RuntimeList):
-            self._builtin_type_error("列表", rt.type_name(lst))
+            self._builtin_type_error("push", "列表", rt.type_name(lst))
         lst.items.append(val)
         lst.size = len(lst.items)
         return lst
@@ -551,7 +583,7 @@ class VM:
     def _bi_pop(self, args):
         lst = args[0]
         if not isinstance(lst, rt.RuntimeList):
-            self._builtin_type_error("列表", rt.type_name(lst))
+            self._builtin_type_error("pop", "列表", rt.type_name(lst))
         if not lst.items:
             return None
         return lst.items.pop()
@@ -589,39 +621,85 @@ class VM:
         return 0.0
 
     def _bi_range(self, args):
-        start, stop, step = 0, 0, 1
-        if len(args) == 1:
-            stop = args[0]
-        elif len(args) == 2:
-            start, stop = args
-        elif len(args) == 3:
-            start, stop, step = args
+        n = len(args)
+        if n == 1:
+            start, stop, step = 0, args[0], 1
+        elif n == 2:
+            start, stop, step = args[0], args[1], 1
         else:
-            self._builtin_type_error("1~3 个参数", str(len(args)))
+            start, stop, step = args[0], args[1], args[2]
+        for v in (start, stop, step):
+            if not _is_int(v):
+                self._builtin_type_error("range", "整数", rt.type_name(v))
+        if step == 0:
+            line = self._cur_line or 1
+            self._runtime_error(diag.runtime_invalid_argument(
+                "range", "步长 step 不能为 0",
+                "给 range() 一个非零步长（正数递增、负数递减）。",
+                line, 1, self._line(line)))
         return self.heap.allocate_list(list(range(start, stop + 1, step)))
 
     def _bi_abs(self, args):
-        return abs(args[0])
+        v = args[0]
+        if not _is_number(v):
+            self._builtin_type_error("abs", "数字", rt.type_name(v))
+        return -v if v < 0 else v
 
     def _bi_min(self, args):
+        self._check_orderable("min", args)
+        if all(isinstance(v, (str, rt.RuntimeString)) for v in args):
+            return min(_to_py_str(v) for v in args)
         return min(args)
 
     def _bi_max(self, args):
+        self._check_orderable("max", args)
+        if all(isinstance(v, (str, rt.RuntimeString)) for v in args):
+            return max(_to_py_str(v) for v in args)
         return max(args)
 
+    def _check_orderable(self, name, args):
+        """min/max：所有实参必须同为数字，或同为字符串（与比较运算符口径一致）。"""
+        nums = all(_is_number(v) for v in args)
+        strs = all(isinstance(v, (str, rt.RuntimeString)) for v in args)
+        if not nums and not strs:
+            types = sorted({rt.type_name(v) for v in args})
+            self._builtin_type_error(
+                name, "全部为数字或全部为字符串", "、".join(types))
+
     def _bi_sqrt(self, args):
-        return math.sqrt(args[0])
+        v = args[0]
+        if not _is_number(v):
+            self._builtin_type_error("sqrt", "非负数字", rt.type_name(v))
+        if v < 0:
+            line = self._cur_line or 1
+            self._runtime_error(diag.runtime_invalid_argument(
+                "sqrt", f"不能对负数 {v} 开平方（实数范围内没有结果）",
+                "开平方前先判断参数是否 >= 0；若确实需要复数结果，请改用 abs() 或自行处理符号。",
+                line, 1, self._line(line)))
+        return math.sqrt(v)
 
     def _bi_floor(self, args):
-        return int(math.floor(args[0]))
+        v = args[0]
+        if not _is_number(v):
+            self._builtin_type_error("floor", "数字", rt.type_name(v))
+        return int(math.floor(v))
 
     def _bi_ceil(self, args):
-        return int(math.ceil(args[0]))
+        v = args[0]
+        if not _is_number(v):
+            self._builtin_type_error("ceil", "数字", rt.type_name(v))
+        return int(math.ceil(v))
 
     def _bi_round(self, args):
+        v = args[0]
+        if not _is_number(v):
+            self._builtin_type_error("round", "数字", rt.type_name(v))
         if len(args) == 2:
-            return round(args[0], args[1])
-        return round(args[0], 1)
+            digits = args[1]
+            if not _is_int(digits):
+                self._builtin_type_error("round", "整数（保留位数）", rt.type_name(digits))
+            return round(v, digits)
+        return round(v, 1)
 
     def _bi_input(self, args):
         if self.input_queue:
@@ -639,15 +717,24 @@ class VM:
         self.return_value = code
         raise SystemExitSignal()
 
-    def _builtin_type_error(self, expected, actual):
+    def _builtin_type_error(self, name, expected, actual):
         line = self._cur_line or 1
-        self._runtime_error(diag.runtime_wrong_type(
-            expected, actual, line, 1, self._line(line)))
+        self._runtime_error(diag.runtime_builtin_type_error(
+            name, expected, actual, line, 1, self._line(line)))
 
 
 # ---------------------------------------------------------------------------
 # 辅助函数
 # ---------------------------------------------------------------------------
+def _is_number(v) -> bool:
+    """MiniLang 数字（bool 按语言语义不参与算术，与 _check_numeric 口径一致）。"""
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def _is_int(v) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
 def _to_py_str(v) -> str:
     if isinstance(v, rt.RuntimeString):
         return v.value
@@ -662,9 +749,15 @@ def _to_py_str(v) -> str:
     return str(v)
 
 
-def _to_display(v) -> str:
+def _to_display(v, _seen=None) -> str:
     if isinstance(v, rt.RuntimeList):
-        return "[" + ", ".join(_to_display(x) for x in v.items) + "]"
+        # 循环引用保护：push(a, a) 这类结构直接显示占位，避免无限递归
+        if _seen is None:
+            _seen = set()
+        if id(v) in _seen:
+            return "[...]"
+        _seen.add(id(v))
+        return "[" + ", ".join(_to_display(x, _seen) for x in v.items) + "]"
     if isinstance(v, rt.RuntimeString):
         return v.value
     if isinstance(v, str):

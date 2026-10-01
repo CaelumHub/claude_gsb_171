@@ -25,8 +25,8 @@ from .diagnostics import (
 BUILTIN_SIGNATURES = {
     "print": None, "len": 1, "push": 2, "pop": 1, "type": 1,
     "str": 1, "int": 1, "float": 1, "range": None, "abs": 1,
-    "min": 2, "max": 2, "sqrt": 1, "floor": 1, "ceil": 1,
-    "round": None, "input": 0, "time": 0, "random": 0, "exit": 0,
+    "min": None, "max": None, "sqrt": 1, "floor": 1, "ceil": 1,
+    "round": None, "input": 0, "time": 0, "random": 0, "exit": None,
 }
 
 # 运算符返回类型表（用于简单的类型推断）

@@ -151,6 +151,87 @@ def _test_runtime_errors():
     _check("错误诊断：未定义变量带 did-you-mean 修复建议", ok3,
            str([(e.message, e.fix) for e in errs3]) if not ok3 else "")
 
+    # ---- 参数越界 / 非法参数：必须统一为结构化诊断，绝不冒泡成 500 ----
+    def expect_diag(src, keyword=None, phase="runtime"):
+        try:
+            r = _run(src)
+        except Exception as e:  # 任何逃逸到服务层的异常都算失败
+            return False, f"异常逃逸: {type(e).__name__}: {e}"
+        e = r.get("error")
+        if not e:
+            return False, "缺少 error 诊断"
+        if e.get("phase") != phase or e.get("severity") != "error":
+            return False, f"phase/severity 不符: {e.get('phase')}/{e.get('severity')}"
+        for key in ("message", "fix", "line", "column", "kind"):
+            if key not in e:
+                return False, f"诊断缺少字段 {key}"
+        if not e.get("fix"):
+            return False, "诊断缺少修复建议 fix"
+        if keyword and keyword not in e.get("message", ""):
+            return False, f"message 未包含 {keyword!r}: {e.get('message')}"
+        return True, ""
+
+    illegal_arg_cases = [
+        ("print(sqrt(-1));", "sqrt"),
+        ("print(sqrt(\"x\"));", "sqrt"),
+        ("print(abs(\"x\"));", "abs"),
+        ("print(floor(\"x\"));", "floor"),
+        ("print(ceil(null));", "ceil"),
+        ("print(min(1, \"a\"));", "min"),
+        ("print(max(1, [2]));", "max"),
+        ("print(round(\"x\"));", "round"),
+        ("print(range(1, 5, 0));", "step"),
+        ("print(range(1.5));", "range"),
+        ("print(len(123));", "len"),
+        ("print(push(1, 2));", "push"),
+        ('print("a" - "b");', "类型错误"),
+    ]
+    all_ok = True
+    details = []
+    for src, kw in illegal_arg_cases:
+        ok, why = expect_diag(src, kw)
+        all_ok &= ok
+        if not ok:
+            details.append(f"{src} -> {why}")
+    _check("运行时错误：非法参数统一产生结构化诊断（不产生 500）",
+           all_ok, "; ".join(details))
+
+    # 变长内置函数参数个数越界
+    ok_a, why_a = expect_diag("print(min());", "min")
+    ok_b, why_b = expect_diag("print(round(1, 2, 3));", "round")
+    _check("运行时错误：内置函数参数个数越界产生诊断",
+           ok_a and ok_b, f"{why_a} {why_b}")
+
+    # 同样的非法参数出现在调试会话中也不得崩溃
+    try:
+        st = svc_debug_safe("var x = -1;\nprint(sqrt(x));")
+        dbg_ok = st.get("finished") and st.get("error") is not None \
+            and "sqrt" in st["error"].get("message", "")
+    except Exception as e:
+        dbg_ok, st = False, f"调试异常: {type(e).__name__}: {e}"
+    _check("运行时错误：调试会话中的非法参数同样产生结构化诊断", dbg_ok,
+           str(st.get("error", st) if isinstance(st, dict) else st))
+
+    # 合法调用必须仍然正常（防止误伤）
+    valid_ok = True
+    for src, want in [
+        ("print(sqrt(16));", "4.0"),
+        ("print(abs(-7), min(3, 1, 2), max(2, 9), floor(2.9), ceil(2.1));", "7 1 9 2 3"),
+        ("print(3.5 + 1, 0.1 + 0.2 > 0);", "4.5 true"),
+    ]:
+        r = _run(src)
+        if r.get("error") or r.get("output") != [want]:
+            valid_ok = False
+            details.append(f"{src} -> {r.get('output')} / {r.get('error')}")
+    _check("运行时错误：合法算术与内置调用不受误伤", valid_ok, "; ".join(details))
+
+
+def svc_debug_safe(source):
+    from . import service
+    svc = service.Service()
+    state = svc.debug_start(source, [])
+    return state
+
 
 def _test_debugger():
     src = ("var total = 0;\n"
